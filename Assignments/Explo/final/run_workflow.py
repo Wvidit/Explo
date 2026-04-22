@@ -143,7 +143,7 @@ def run_database_and_ml(mapdl=None, n_samples=200):
     # Reverse design demo: find microstructure for k_eff = 3.0 W/m K
     target_k = 3.0
     print(f"\n  Reverse design: target k_eff = {target_k} W/m K")
-    best, err, grid = reverse_design(models, "k_eff_WpmK", target_k)
+    best, err, grid = reverse_design(models, "k_eff_WpmK", target_k, records=records)
     print(f"  -> Best: porosity={best['porosity']*100:.2f}%, "
           f"seeds={best['n_seeds']}, "
           f"predicted={best['predicted_value']:.3f} W/m K")

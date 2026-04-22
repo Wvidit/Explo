@@ -264,10 +264,15 @@ def train_surrogates(records,
 def reverse_design(models, target_property, target_value,
                    porosity_range=(0.005, 0.035),
                    seed_range=(20, 150),
-                   n_grid=50):
+                   n_grid=50,
+                   records=None):
     """
     Grid-search the microstructure parameter space to find
     combinations that produce a desired target property value.
+
+    Uses the training database to fit empirical mappings from
+    (porosity, n_seeds) → chord features, ensuring the synthetic
+    query points stay within the model's training distribution.
 
     Parameters
     ----------
@@ -283,6 +288,9 @@ def reverse_design(models, target_property, target_value,
         (min, max) n_seeds to search.
     n_grid : int
         Grid points per dimension.
+    records : list of dict or None
+        Training records for fitting empirical feature maps.
+        If None, falls back to simple approximation.
 
     Returns
     -------
@@ -302,26 +310,69 @@ def reverse_design(models, target_property, target_value,
     porosities = np.linspace(*porosity_range, n_grid)
     seeds_arr  = np.linspace(*[float(s) for s in seed_range], n_grid)
 
-    # Build a synthetic feature matrix
-    # For chord lengths, use empirical approximation:
-    #   mean_chord ≈ voxel_res / n_seeds^(1/3)
-    voxel_res = 64   # assumed
+    # ── Fit empirical feature maps from the database ────────────────────
+    # Instead of crude approximations, learn how chord features relate to
+    # (porosity, n_seeds) from the actual training data.
+    if records is not None and len(records) > 10:
+        from sklearn.linear_model import LinearRegression
 
+        db_porosity = np.array([r["porosity"] for r in records])
+        db_nseeds   = np.array([r["n_seeds"]  for r in records])
+
+        # Design matrix: [porosity, n_seeds, porosity², n_seeds², p*ns]
+        X_design = np.column_stack([
+            db_porosity,
+            db_nseeds,
+            db_porosity ** 2,
+            db_nseeds ** 2,
+            db_porosity * db_nseeds,
+        ])
+
+        # Fit a simple polynomial for each chord feature
+        chord_models = {}
+        chord_feature_keys = [
+            "mean_chord_x", "mean_chord_y", "mean_chord_z",
+            "var_chord_x", "var_chord_y", "var_chord_z",
+            "mean_chord_avg",
+        ]
+        for key in chord_feature_keys:
+            y = np.array([r[key] for r in records])
+            lr = LinearRegression().fit(X_design, y)
+            chord_models[key] = lr
+
+        def _predict_features(p, ns):
+            x = np.array([[p, ns, p**2, ns**2, p * ns]])
+            feats = {k: float(chord_models[k].predict(x)[0])
+                     for k in chord_feature_keys}
+            return feats
+    else:
+        # Fallback: simple approximation
+        def _predict_features(p, ns):
+            mc = 64 / max(ns, 1) ** (1.0/3.0)
+            mc_var = mc * 0.15 + 450
+            return {
+                "mean_chord_x": mc, "mean_chord_y": mc, "mean_chord_z": mc,
+                "var_chord_x": mc_var, "var_chord_y": mc_var,
+                "var_chord_z": mc_var, "mean_chord_avg": mc,
+            }
+
+    # ── Grid search ─────────────────────────────────────────────────────
     grid_results = []
     best_error = np.inf
     best_params = None
 
     for p in porosities:
         for ns in seeds_arr:
-            mc = voxel_res / (ns ** (1.0/3.0))
-            mc_var = mc * 0.1   # approximate
+            feats = _predict_features(p, ns)
 
             features = np.array([[
-                p,        # porosity
-                mc, mc, mc,    # mean_chord_{x,y,z}
-                mc_var, mc_var, mc_var,   # var_chord_{x,y,z}
-                mc,       # mean_chord_avg
-                ns,       # n_seeds
+                p,
+                feats["mean_chord_x"], feats["mean_chord_y"],
+                feats["mean_chord_z"],
+                feats["var_chord_x"], feats["var_chord_y"],
+                feats["var_chord_z"],
+                feats["mean_chord_avg"],
+                ns,
             ]])
 
             pred = model.predict(features)[0]
@@ -346,104 +397,188 @@ def reverse_design(models, target_property, target_value,
 #  Visualization
 # ═══════════════════════════════════════════════════════════════════════════
 
+def _apply_dark_theme():
+    """Apply the shared dark theme used across all plots."""
+    BG       = "#0f1117"
+    PANEL_BG = "#181c25"
+    TEXT     = "#e0e4ec"
+    GRID_CLR = "#2a2f3a"
+
+    plt.rcParams.update({
+        "figure.facecolor": BG,
+        "axes.facecolor":   PANEL_BG,
+        "axes.edgecolor":   GRID_CLR,
+        "axes.labelcolor":  TEXT,
+        "text.color":       TEXT,
+        "xtick.color":      TEXT,
+        "ytick.color":      TEXT,
+        "grid.color":       GRID_CLR,
+        "grid.alpha":       0.3,
+        "font.family":      "sans-serif",
+        "font.size":        10,
+    })
+    return BG, PANEL_BG, TEXT, GRID_CLR
+
+
 def plot_parity(Y_test, metrics, save_path=None):
-    """Predicted vs actual scatter plots for all targets."""
+    """Dark-themed predicted vs actual scatter plots for all targets."""
+    BG, PANEL_BG, TEXT, GRID_CLR = _apply_dark_theme()
+    ACCENT  = "#6ee7b7"
+    ACCENT2 = "#f472b6"
+
+    # Bright scatter palette for each subplot
+    palette = ["#60a5fa", "#34d399", "#f472b6", "#fbbf24", "#a78bfa", "#fb923c"]
+
     n = len(Y_test)
     cols = min(3, n)
     rows = (n + cols - 1) // cols
 
-    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4.5*rows))
+    fig, axes = plt.subplots(rows, cols, figsize=(5.5*cols, 5*rows))
+    fig.suptitle("ML Surrogate — Parity Plots",
+                 fontsize=16, fontweight="bold", color=ACCENT, y=0.98)
     axes = np.atleast_2d(axes)
 
     for idx, (target, (y_true, y_pred)) in enumerate(Y_test.items()):
         ax = axes[idx // cols, idx % cols]
-        ax.scatter(y_true, y_pred, s=20, alpha=0.6, edgecolors="k", lw=0.3)
+        color = palette[idx % len(palette)]
+
+        ax.scatter(y_true, y_pred, s=28, alpha=0.7,
+                   color=color, edgecolors="none", rasterized=True)
+
         lo = min(y_true.min(), y_pred.min())
         hi = max(y_true.max(), y_pred.max())
-        margin = (hi - lo) * 0.05
+        margin = (hi - lo) * 0.08
         ax.plot([lo-margin, hi+margin], [lo-margin, hi+margin],
-                "r--", lw=1.5, label="ideal")
-        ax.set_xlabel("Actual")
-        ax.set_ylabel("Predicted")
-        r2 = metrics[target]["R2"]
-        ax.set_title(f"{metrics[target]['label']}\nR²={r2:.3f}", fontsize=10)
-        ax.legend(fontsize=8)
+                color=ACCENT, lw=1.5, ls="--", alpha=0.8, label="Ideal")
 
-    # Hide unused axes
+        ax.set_xlabel("Actual", fontsize=10)
+        ax.set_ylabel("Predicted", fontsize=10)
+        r2 = metrics[target]["R2"]
+        mae = metrics[target]["MAE"]
+        ax.set_title(f"{metrics[target]['label']}\nR²={r2:.3f}  MAE={mae:.4f}",
+                     fontsize=10, fontweight="bold", color=TEXT, pad=8)
+        ax.legend(fontsize=8, facecolor=PANEL_BG, edgecolor=GRID_CLR,
+                  labelcolor=TEXT)
+        ax.grid(True, alpha=0.15)
+        ax.tick_params(labelsize=8)
+
     for idx in range(n, rows * cols):
         axes[idx // cols, idx % cols].set_visible(False)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is None:
         save_path = os.path.join(OUTPUT_DIR, "ml_parity_plots.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=180, bbox_inches="tight",
+                facecolor=BG, edgecolor="none")
     print(f"  → Saved parity plots: {save_path}")
     plt.close()
+    plt.rcdefaults()
 
 
 def plot_feature_importance(models, metrics, save_path=None):
-    """Feature importance bar charts for all models."""
+    """Dark-themed feature importance bar charts for all models."""
+    BG, PANEL_BG, TEXT, GRID_CLR = _apply_dark_theme()
+    ACCENT = "#6ee7b7"
+
+    # Gradient colors for bars
+    bar_colors = ["#60a5fa", "#34d399", "#f472b6", "#fbbf24", "#a78bfa", "#fb923c"]
+
     n = len(models)
     cols = min(3, n)
     rows = (n + cols - 1) // cols
 
-    fig, axes = plt.subplots(rows, cols, figsize=(5*cols, 4*rows))
+    fig, axes = plt.subplots(rows, cols, figsize=(5.5*cols, 4.5*rows))
+    fig.suptitle("Feature Importance — Gradient Boosting",
+                 fontsize=16, fontweight="bold", color=ACCENT, y=0.98)
     axes = np.atleast_2d(axes)
 
     for idx, (target, model) in enumerate(models.items()):
         ax = axes[idx // cols, idx % cols]
         importances = model.feature_importances_
-        sorted_idx = np.argsort(importances)[::-1]
+        sorted_idx = np.argsort(importances)
 
-        ax.barh(
-            [FEATURE_COLS[i] for i in sorted_idx],
-            importances[sorted_idx],
-            color="steelblue",
-        )
-        ax.set_title(metrics[target]["label"], fontsize=10)
-        ax.set_xlabel("Importance")
+        labels = [FEATURE_COLS[i] for i in sorted_idx]
+        vals = importances[sorted_idx]
+        color = bar_colors[idx % len(bar_colors)]
+
+        bars = ax.barh(labels, vals, color=color, alpha=0.85,
+                       edgecolor="none", height=0.7)
+
+        # Add value labels
+        for bar, v in zip(bars, vals):
+            if v > 0.01:
+                ax.text(v + 0.005, bar.get_y() + bar.get_height()/2,
+                        f"{v:.2f}", va="center", fontsize=7, color="#94a3b8")
+
+        ax.set_title(metrics[target]["label"], fontsize=10,
+                     fontweight="bold", color=TEXT, pad=8)
+        ax.set_xlabel("Importance", fontsize=9)
+        ax.tick_params(labelsize=8)
+        ax.grid(True, axis="x", alpha=0.15)
 
     for idx in range(n, rows * cols):
         axes[idx // cols, idx % cols].set_visible(False)
 
-    plt.tight_layout()
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is None:
         save_path = os.path.join(OUTPUT_DIR, "feature_importance.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=180, bbox_inches="tight",
+                facecolor=BG, edgecolor="none")
     print(f"  → Saved feature importance: {save_path}")
     plt.close()
+    plt.rcdefaults()
 
 
 def plot_property_vs_porosity(records, save_path=None):
-    """Plot all four target properties vs porosity."""
-    fig, axes = plt.subplots(2, 2, figsize=(10, 8))
-    porosities = [r["porosity_pct"] for r in records]
+    """Dark-themed property vs porosity scatter plots."""
+    BG, PANEL_BG, TEXT, GRID_CLR = _apply_dark_theme()
+    ACCENT = "#6ee7b7"
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+    fig.suptitle("Structure–Property Relationships",
+                 fontsize=16, fontweight="bold", color=ACCENT, y=0.98)
+
+    porosities = np.array([r["porosity_pct"] for r in records])
+    n_seeds = np.array([r["n_seeds"] for r in records])
 
     targets = [
-        ("k_eff_WpmK",    "Thermal Conductivity (W/m·K)"),
-        ("density_kgpm3", "Density (kg/m³)"),
-        ("HV",            "Vickers Hardness (HV)"),
-        ("E_eff_GPa",     "Young's Modulus (GPa)"),
+        ("k_eff_WpmK",    "Thermal Conductivity (W/m·K)", "#60a5fa"),
+        ("density_kgpm3", "Density (kg/m³)",               "#34d399"),
+        ("HV",            "Vickers Hardness (HV)",         "#f472b6"),
+        ("E_eff_GPa",     "Young's Modulus (GPa)",         "#fbbf24"),
     ]
 
-    for ax, (key, label) in zip(axes.flat, targets):
-        vals = [r[key] for r in records]
-        ax.scatter(porosities, vals, s=15, alpha=0.6, edgecolors="k", lw=0.3)
-        ax.set_xlabel("Porosity (%)")
-        ax.set_ylabel(label)
-        ax.set_title(label)
+    for ax, (key, label, color) in zip(axes.flat, targets):
+        vals = np.array([r[key] for r in records])
 
-    plt.tight_layout()
+        # Colour by n_seeds for multi-dimensional insight
+        sc = ax.scatter(porosities, vals, c=n_seeds, cmap="magma",
+                        s=25, alpha=0.75, edgecolors="none", rasterized=True)
+
+        ax.set_xlabel("Porosity (%)", fontsize=10)
+        ax.set_ylabel(label, fontsize=10)
+        ax.set_title(label, fontsize=11, fontweight="bold", color=TEXT, pad=8)
+        ax.grid(True, alpha=0.15)
+        ax.tick_params(labelsize=8)
+
+        # Colorbar
+        cbar = plt.colorbar(sc, ax=ax, pad=0.02, shrink=0.85)
+        cbar.set_label("n_seeds", fontsize=8, color="#94a3b8")
+        cbar.ax.tick_params(labelsize=7, colors="#94a3b8")
+
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
     if save_path is None:
         save_path = os.path.join(OUTPUT_DIR, "property_vs_porosity.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=180, bbox_inches="tight",
+                facecolor=BG, edgecolor="none")
     print(f"  → Saved property vs porosity: {save_path}")
     plt.close()
+    plt.rcdefaults()
 
 
 def plot_reverse_design(grid_results, target_property, target_value,
                         best_params, save_path=None):
-    """Heatmap of predicted property over porosity × n_seeds grid."""
+    """Publication-quality reverse design heatmap with dark theme."""
     porosities = grid_results[:, 0]
     seeds      = grid_results[:, 1]
     values     = grid_results[:, 2]
@@ -453,28 +588,85 @@ def plot_reverse_design(grid_results, target_property, target_value,
     S = seeds.reshape(n_grid, n_grid)
     V = values.reshape(n_grid, n_grid)
 
-    fig, ax = plt.subplots(figsize=(8, 6))
-    cf = ax.contourf(P * 100, S, V, levels=30, cmap="viridis")
-    plt.colorbar(cf, ax=ax, label=TARGET_COLS.get(target_property, target_property))
+    # ── Dark theme ──────────────────────────────────────────────────────
+    BG       = "#0f1117"
+    PANEL_BG = "#181c25"
+    TEXT     = "#e0e4ec"
+    ACCENT   = "#6ee7b7"
+    GRID_CLR = "#2a2f3a"
 
-    # Mark target contour
-    ax.contour(P * 100, S, V, levels=[target_value], colors="red", linewidths=2)
+    plt.rcParams.update({
+        "figure.facecolor": BG,
+        "axes.facecolor":   PANEL_BG,
+        "axes.edgecolor":   GRID_CLR,
+        "axes.labelcolor":  TEXT,
+        "text.color":       TEXT,
+        "xtick.color":      TEXT,
+        "ytick.color":      TEXT,
+        "font.family":      "sans-serif",
+        "font.size":        11,
+    })
 
-    # Mark best point
-    ax.plot(best_params["porosity"] * 100, best_params["n_seeds"],
-            "r*", markersize=15, label=f"Best: {best_params['predicted_value']:.3f}")
+    fig, ax = plt.subplots(figsize=(10, 7))
 
-    ax.set_xlabel("Porosity (%)")
-    ax.set_ylabel("Number of Seeds (grain count)")
-    ax.set_title(f"Reverse Design: Target {TARGET_COLS.get(target_property, target_property)} = {target_value}")
-    ax.legend()
+    prop_label = TARGET_COLS.get(target_property, target_property)
+
+    # Smooth filled contour
+    cf = ax.contourf(
+        P * 100, S, V,
+        levels=40, cmap="magma",
+    )
+    cbar = plt.colorbar(cf, ax=ax, pad=0.02)
+    cbar.set_label(prop_label, fontsize=12, color=TEXT)
+    cbar.ax.tick_params(colors=TEXT, labelsize=9)
+
+    # Target contour line
+    target_cs = ax.contour(
+        P * 100, S, V,
+        levels=[target_value], colors=[ACCENT], linewidths=2.5,
+        linestyles="--",
+    )
+    ax.clabel(target_cs, fmt=f"Target = {target_value:.2f}",
+              fontsize=9, colors=[ACCENT])
+
+    # Best point
+    ax.plot(
+        best_params["porosity"] * 100, best_params["n_seeds"],
+        marker="*", markersize=20, color="#f472b6",
+        markeredgecolor="white", markeredgewidth=1.2,
+        zorder=10,
+    )
+    # Annotation box for best point
+    pred_val = best_params["predicted_value"]
+    ax.annotate(
+        f"Best: {pred_val:.3f}\n"
+        f"φ = {best_params['porosity']*100:.2f}%\n"
+        f"seeds = {best_params['n_seeds']}",
+        xy=(best_params["porosity"] * 100, best_params["n_seeds"]),
+        xytext=(20, 25), textcoords="offset points",
+        fontsize=10, color=TEXT,
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#1e2330",
+                  edgecolor=ACCENT, alpha=0.9),
+        arrowprops=dict(arrowstyle="->", color=ACCENT, lw=1.5),
+        zorder=11,
+    )
+
+    ax.set_xlabel("Porosity (%)", fontsize=13, labelpad=8)
+    ax.set_ylabel("Number of Seeds (grain count)", fontsize=13, labelpad=8)
+    ax.set_title(
+        f"Reverse Design Map — Target {prop_label} = {target_value}",
+        fontsize=15, fontweight="bold", color=ACCENT, pad=14,
+    )
+    ax.tick_params(labelsize=10)
 
     plt.tight_layout()
     if save_path is None:
         save_path = os.path.join(OUTPUT_DIR, "reverse_design_map.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=180, bbox_inches="tight",
+                facecolor=BG, edgecolor="none")
     print(f"  → Saved reverse design map: {save_path}")
     plt.close()
+    plt.rcdefaults()
 
 
 def save_models(models, directory=None):

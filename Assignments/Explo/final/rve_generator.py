@@ -341,7 +341,13 @@ def compute_descriptors(rve, metadata=None):
 
 def visualize_rve(rve, grain_ids, save_path=None, show_grains=True):
     """
-    3D voxel visualisation of the RVE.
+    Publication-quality 2×2 RVE visualisation.
+
+    Layout:
+      Top-left:     3D grain boundaries (coloured by grain ID)
+      Top-right:    3D pore network (depth-coloured)
+      Bottom-left:  2D mid-slice cross-section (grains + pores)
+      Bottom-right: Microstructure statistics panel
 
     Parameters
     ----------
@@ -354,50 +360,238 @@ def visualize_rve(rve, grain_ids, save_path=None, show_grains=True):
     show_grains : bool
         If True, colour matrix by grain ID. If False, uniform colour.
     """
-    fig = plt.figure(figsize=(14, 6))
+    from matplotlib.colors import Normalize
+    from matplotlib import cm
 
-    # --- Subplot 1: grain structure (surface voxels only) ---
-    ax1 = fig.add_subplot(121, projection="3d")
     N = rve.shape[0]
+    porosity = float(rve.sum()) / rve.size
+    n_grains = len(np.unique(grain_ids))
 
-    # Show only surface and boundary voxels for performance
-    # For large grids, subsample
-    step = max(1, N // 32)
-    sub_rve = rve[::step, ::step, ::step]
-    sub_grains = grain_ids[::step, ::step, ::step]
-    sN = sub_rve.shape[0]
+    # ── Dark theme ──────────────────────────────────────────────────────
+    BG       = "#0f1117"
+    PANEL_BG = "#181c25"
+    TEXT     = "#e0e4ec"
+    ACCENT   = "#6ee7b7"
+    ACCENT2  = "#f472b6"
+    GRID_CLR = "#2a2f3a"
 
-    # Matrix voxels at boundaries (where grain changes)
-    mask_matrix = sub_rve == 0
-    # Detect boundaries
-    boundary = np.zeros_like(mask_matrix)
-    boundary[:-1, :, :] |= (sub_grains[:-1, :, :] != sub_grains[1:, :, :])
-    boundary[:, :-1, :] |= (sub_grains[:, :-1, :] != sub_grains[:, 1:, :])
-    boundary[:, :, :-1] |= (sub_grains[:, :, :-1] != sub_grains[:, :, 1:])
+    plt.rcParams.update({
+        "figure.facecolor": BG,
+        "axes.facecolor":   PANEL_BG,
+        "axes.edgecolor":   GRID_CLR,
+        "axes.labelcolor":  TEXT,
+        "text.color":       TEXT,
+        "xtick.color":      TEXT,
+        "ytick.color":      TEXT,
+        "grid.color":       GRID_CLR,
+        "grid.alpha":       0.3,
+        "font.family":      "sans-serif",
+        "font.size":        10,
+    })
 
-    # Plot grain boundaries
-    bi, bj, bk = np.where(boundary & mask_matrix)
-    colors = sub_grains[boundary & mask_matrix] if show_grains else None
-    ax1.scatter(bi, bj, bk, c=colors, cmap="tab20", s=1, alpha=0.4)
-    ax1.set_title("Grain Boundaries", fontsize=11)
-    ax1.set_xlabel("X"); ax1.set_ylabel("Y"); ax1.set_zlabel("Z")
+    fig = plt.figure(figsize=(16, 14))
+    fig.suptitle(
+        "Wollastonite RVE Microstructure",
+        fontsize=18, fontweight="bold", color=ACCENT, y=0.97,
+    )
 
-    # --- Subplot 2: pore distribution ---
-    ax2 = fig.add_subplot(122, projection="3d")
+    # ── (1) Top-left — 3D Grain Boundaries ──────────────────────────────
+    ax1 = fig.add_subplot(221, projection="3d")
+    ax1.set_facecolor(PANEL_BG)
+    ax1.xaxis.pane.fill = False
+    ax1.yaxis.pane.fill = False
+    ax1.zaxis.pane.fill = False
+    ax1.xaxis.pane.set_edgecolor(GRID_CLR)
+    ax1.yaxis.pane.set_edgecolor(GRID_CLR)
+    ax1.zaxis.pane.set_edgecolor(GRID_CLR)
+    ax1.grid(True, alpha=0.15)
+
+    # Detect grain boundaries at full resolution
+    boundary = np.zeros((N, N, N), dtype=bool)
+    boundary[:-1, :, :] |= (grain_ids[:-1, :, :] != grain_ids[1:, :, :])
+    boundary[:, :-1, :] |= (grain_ids[:, :-1, :] != grain_ids[:, 1:, :])
+    boundary[:, :, :-1] |= (grain_ids[:, :, :-1] != grain_ids[:, :, 1:])
+    mask_matrix = rve == 0
+    boundary_pts = boundary & mask_matrix
+
+    # Subsample for rendering (max ~12k points)
+    bi, bj, bk = np.where(boundary_pts)
+    max_pts = 12000
+    if len(bi) > max_pts:
+        idx = np.random.choice(len(bi), max_pts, replace=False)
+        bi, bj, bk = bi[idx], bj[idx], bk[idx]
+
+    if show_grains and len(bi) > 0:
+        c_vals = grain_ids[bi, bj, bk].astype(float)
+        ax1.scatter(
+            bi, bj, bk,
+            c=c_vals, cmap="Spectral", s=1.0, alpha=0.55,
+            edgecolors="none", rasterized=True,
+        )
+    elif len(bi) > 0:
+        ax1.scatter(
+            bi, bj, bk,
+            color=ACCENT, s=0.8, alpha=0.4,
+            edgecolors="none", rasterized=True,
+        )
+
+    ax1.set_title("Grain Boundaries", fontsize=13, fontweight="bold",
+                  color=TEXT, pad=12)
+    ax1.set_xlabel("X", labelpad=8)
+    ax1.set_ylabel("Y", labelpad=8)
+    ax1.set_zlabel("Z", labelpad=8)
+    ax1.set_xlim(0, N); ax1.set_ylim(0, N); ax1.set_zlim(0, N)
+    ax1.view_init(elev=25, azim=135)
+    ax1.tick_params(labelsize=8)
+
+    # ── (2) Top-right — 3D Pore Network ─────────────────────────────────
+    ax2 = fig.add_subplot(222, projection="3d")
+    ax2.set_facecolor(PANEL_BG)
+    ax2.xaxis.pane.fill = False
+    ax2.yaxis.pane.fill = False
+    ax2.zaxis.pane.fill = False
+    ax2.xaxis.pane.set_edgecolor(GRID_CLR)
+    ax2.yaxis.pane.set_edgecolor(GRID_CLR)
+    ax2.zaxis.pane.set_edgecolor(GRID_CLR)
+    ax2.grid(True, alpha=0.15)
+
     pi, pj, pk = np.where(rve == 1)
-    if len(pi) > 5000:
-        idx = np.random.choice(len(pi), 5000, replace=False)
+    max_pore_pts = 8000
+    if len(pi) > max_pore_pts:
+        idx = np.random.choice(len(pi), max_pore_pts, replace=False)
         pi, pj, pk = pi[idx], pj[idx], pk[idx]
-    ax2.scatter(pi, pj, pk, c="red", s=3, alpha=0.7, label="Pores")
-    ax2.set_title(f"Pore Distribution ({rve.sum()}/{rve.size} voxels)", fontsize=11)
-    ax2.set_xlabel("X"); ax2.set_ylabel("Y"); ax2.set_zlabel("Z")
-    ax2.legend()
 
-    plt.tight_layout()
+    if len(pi) > 0:
+        # Depth-colour by Z coordinate for 3D perception
+        depth = pk.astype(float) / N
+        ax2.scatter(
+            pi, pj, pk,
+            c=depth, cmap="magma", s=4, alpha=0.75,
+            edgecolors="none", rasterized=True,
+        )
+
+    n_pore = int(rve.sum())
+    ax2.set_title(
+        f"Pore Network  ({n_pore:,} / {rve.size:,} voxels)",
+        fontsize=13, fontweight="bold", color=TEXT, pad=12,
+    )
+    ax2.set_xlabel("X", labelpad=8)
+    ax2.set_ylabel("Y", labelpad=8)
+    ax2.set_zlabel("Z", labelpad=8)
+    ax2.set_xlim(0, N); ax2.set_ylim(0, N); ax2.set_zlim(0, N)
+    ax2.view_init(elev=25, azim=135)
+    ax2.tick_params(labelsize=8)
+
+    # ── (3) Bottom-left — 2D Mid-slice Cross-section ────────────────────
+    ax3 = fig.add_subplot(223)
+    mid = N // 2
+    slice_grains = grain_ids[:, :, mid].astype(float)
+    slice_pores  = rve[:, :, mid]
+
+    # Grain map with pore overlay
+    ax3.imshow(
+        slice_grains.T, origin="lower", cmap="Spectral",
+        interpolation="nearest", alpha=0.85,
+    )
+    # Overlay pores as bright pink
+    pore_overlay = np.ma.masked_where(slice_pores == 0, slice_pores)
+    ax3.imshow(
+        pore_overlay.T, origin="lower", cmap="spring",
+        interpolation="nearest", alpha=1.0, vmin=0, vmax=1,
+    )
+
+    ax3.set_title(
+        f"Cross-section at Z = {mid}",
+        fontsize=13, fontweight="bold", color=TEXT, pad=10,
+    )
+    ax3.set_xlabel("X"); ax3.set_ylabel("Y")
+    ax3.tick_params(labelsize=8)
+
+    # Add scale bar
+    bar_len = N // 4
+    bar_y = N * 0.05
+    ax3.plot([N*0.05, N*0.05 + bar_len], [bar_y, bar_y],
+             color=ACCENT, linewidth=3, solid_capstyle="butt")
+    ax3.text(N*0.05 + bar_len/2, bar_y + N*0.04,
+             f"{bar_len} voxels", color=ACCENT,
+             ha="center", fontsize=9, fontweight="bold")
+
+    # ── (4) Bottom-right — Statistics Panel ─────────────────────────────
+    ax4 = fig.add_subplot(224)
+    ax4.set_facecolor(PANEL_BG)
+    ax4.axis("off")
+
+    # Compute quick stats
+    n_junction = int(boundary_pts.sum())
+
+    stats_lines = [
+        ("MICROSTRUCTURE SUMMARY", "", True),
+        ("", "", False),
+        ("Grid resolution", f"{N}³  =  {N**3:,} voxels", False),
+        ("Grain count", f"{n_grains}", False),
+        ("Pore voxels", f"{n_pore:,}", False),
+        ("Porosity", f"{porosity*100:.2f} %", False),
+        ("Boundary voxels", f"{n_junction:,}", False),
+        ("", "", False),
+        ("POROSITY PROFILE", "", True),
+    ]
+
+    y_pos = 0.92
+    for label, value, is_header in stats_lines:
+        if is_header:
+            ax4.text(0.5, y_pos, label, transform=ax4.transAxes,
+                     fontsize=13, fontweight="bold", color=ACCENT,
+                     ha="center", va="top")
+        elif label == "":
+            pass  # spacer
+        else:
+            ax4.text(0.10, y_pos, label, transform=ax4.transAxes,
+                     fontsize=11, color="#94a3b8", ha="left", va="top")
+            ax4.text(0.90, y_pos, value, transform=ax4.transAxes,
+                     fontsize=11, color=TEXT, fontweight="bold",
+                     ha="right", va="top")
+        y_pos -= 0.065
+
+    # Mini porosity-vs-Z profile
+    z_porosity = np.array([
+        rve[:, :, z].sum() / (N * N) * 100 for z in range(N)
+    ])
+
+    # Inset axes for the profile plot
+    from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+    ax_inset = inset_axes(ax4, width="80%", height="38%",
+                          loc="lower center",
+                          bbox_to_anchor=(0, 0.02, 1, 0.45),
+                          bbox_transform=ax4.transAxes)
+    ax_inset.set_facecolor("#1e2330")
+    ax_inset.fill_between(range(N), z_porosity, alpha=0.35, color=ACCENT2)
+    ax_inset.plot(range(N), z_porosity, color=ACCENT2, linewidth=1.5)
+    ax_inset.axhline(porosity * 100, color=ACCENT, linewidth=1,
+                     linestyle="--", alpha=0.7, label=f"Mean {porosity*100:.2f}%")
+    ax_inset.set_xlabel("Z slice", fontsize=9, color="#94a3b8")
+    ax_inset.set_ylabel("Porosity %", fontsize=9, color="#94a3b8")
+    ax_inset.tick_params(labelsize=7, colors="#94a3b8")
+    ax_inset.spines["top"].set_visible(False)
+    ax_inset.spines["right"].set_visible(False)
+    ax_inset.spines["bottom"].set_color(GRID_CLR)
+    ax_inset.spines["left"].set_color(GRID_CLR)
+    ax_inset.legend(fontsize=8, loc="upper right",
+                    facecolor="#1e2330", edgecolor=GRID_CLR,
+                    labelcolor=TEXT)
+
+    # ── Finalise ────────────────────────────────────────────────────────
+    plt.subplots_adjust(
+        left=0.04, right=0.96, bottom=0.05, top=0.92,
+        wspace=0.15, hspace=0.28,
+    )
     if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=180, bbox_inches="tight",
+                    facecolor=BG, edgecolor="none")
         print(f"  → Saved RVE visualization: {save_path}")
     plt.close()
+
+    # Reset rcParams to defaults
+    plt.rcdefaults()
 
 
 # ═══════════════════════════════════════════════════════════════════════════

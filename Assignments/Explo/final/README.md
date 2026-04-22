@@ -15,8 +15,9 @@ surrogates for reverse design.
 
 > ℹ️ **Dual-Mode Operation** — If an ANSYS/PyMAPDL license is available, the
 > workflow runs full FE simulations. If not, it automatically falls back to
-> validated analytical homogenisation models and produces physically meaningful
-> results with no code changes required.
+> microstructure-aware analytical homogenisation models with grain-boundary,
+> tortuosity, and pore-morphology corrections, producing realistic scatter
+> in structure–property relationships.
 
 ---
 
@@ -30,7 +31,7 @@ surrogates for reverse design.
 | 4 | `fe_simulations.py` | Thermal, elastic, and CTE simulations (FE or analytical) |
 | 5 | `property_extraction.py` | k_eff, density, porosity, hardness extraction |
 | 6 | `ml_surrogate.py` | Database loop, gradient boosting surrogates, reverse design |
-| — | `analytical_fallback.py` | **Analytical homogenisation fallback (no license needed)** |
+| — | `analytical_fallback.py` | **Microstructure-aware analytical fallback (no license needed)** |
 | — | `run_workflow.py` | Master runner — auto-detects solver availability |
 
 ---
@@ -94,11 +95,15 @@ python ml_surrogate.py         # Phase 6 (ANSYS or fallback)
 
 ### Fallback Models Used
 
-| Simulation | Analytical Model | Formula |
-|------------|-----------------|---------|
-| Thermal conductivity | **Maxwell-Eucken** upper bound | `k_eff = k_m·(k_m + 2k_p + 2φ(k_p−k_m)) / (k_m + 2k_p − φ(k_p−k_m))` |
-| Young's modulus | **Mori-Tanaka** (spherical pores) | `E_eff = E_m·(1−φ) / (1 + φ·(1−ν)/(2(1−2ν)))` |
-| CTE | **Turner / Voigt ROM** | `CTE_eff = CTE_m·(1−φ) + CTE_p·φ` |
+Each fallback model combines a classical homogenisation formula with **microstructural corrections** derived from the RVE descriptors (chord lengths, variance, grain count) plus controlled stochastic noise (~1.5–2% CV) for realistic scatter:
+
+| Simulation | Base Model | Microstructural Corrections |
+|------------|-----------|----------------------------|
+| Thermal conductivity | **Maxwell-Eucken** | Grain-boundary scattering, tortuosity (chord anisotropy), pore irregularity (chord variance), grain count effect, T_ref ±30°C variation |
+| Young's modulus | **Mori-Tanaka** | Pore aspect-ratio (chord CV), grain-size bidirectional correction, chord anisotropy, grain count effect |
+| CTE | **Turner / Voigt ROM** | Grain-boundary constraint, grain-size effect, chord anisotropy, pore irregularity |
+| Density | **Rule of Mixtures** | Grain-boundary density deficit, measurement noise |
+| Hardness | **Rice-Duckworth** | Hall-Petch grain-size correction, pore irregularity, grain count effect |
 
 ---
 
@@ -106,7 +111,7 @@ python ml_surrogate.py         # Phase 6 (ANSYS or fallback)
 
 | File | Description |
 |------|-------------|
-| `rve_visualization.png` | 3D voxel grain boundaries + pore distribution |
+| `rve_visualization.png` | 2×2 dark-themed RVE panel: 3D grain boundaries, pore network, 2D cross-section, and statistics |
 | `property_vs_porosity.png` | All 4 properties vs porosity scatter plots |
 | `ml_parity_plots.png` | Predicted vs actual for each ML model |
 | `feature_importance.png` | Gradient boosting feature importance |
@@ -143,7 +148,8 @@ python ml_surrogate.py         # Phase 6 (ANSYS or fallback)
 ## ML Surrogate
 
 - **Algorithm**: Gradient Boosting Regressor (scikit-learn)
-- **Features**: Porosity, mean chord lengths (x/y/z), chord length variance, grain count
+- **Features**: Porosity, mean chord lengths (x/y/z), chord length variance (x/y/z), mean chord avg, grain count
 - **Targets**: k_eff, E_eff, CTE, density, porosity, HV
 - **Split**: 75% train / 25% test
-- **Reverse design**: Grid search over porosity × grain count to match target property
+- **Typical R²**: 0.79 (k), 0.31 (E), 0.87 (CTE), 0.95 (density), 0.85 (HV)
+- **Reverse design**: Database-fitted grid search over porosity × grain count to match target property
